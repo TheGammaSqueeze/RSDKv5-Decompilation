@@ -6,29 +6,51 @@ def retroRevision = 3
 android {
     ndkVersion "24.0.8215888"
     compileSdkVersion 33
+
     buildFeatures {
         prefab true
     }
+
     defaultConfig {
         applicationId "org.rems.rsdkv5"
         minSdkVersion 21
         targetSdkVersion 33
         versionCode 100
         versionName "1.1.0"
-        if(project.hasProperty("RETRO_DISABLE_PLUS"))
+
+        if (project.hasProperty("RETRO_DISABLE_PLUS")) {
             autobuildFlag = true
-        if(project.hasProperty("RETRO_REVISION"))
+        }
+        if (project.hasProperty("RETRO_REVISION")) {
             retroRevision = project.property("RETRO_REVISION")
+        }
+
+        // Drive CMake and pass flags through
         externalNativeBuild {
             cmake {
-                arguments = ["-DANDROID_STL=c++_shared", "-DPLATFORM=Android", "-DRETRO_DISABLE_PLUS=$autobuildFlag", "-DRETRO_REVISION=$retroRevision"]
+                arguments "-DANDROID_STL=c++_shared",
+                          "-DPLATFORM=Android",
+                          "-DRETRO_DISABLE_PLUS=${autobuildFlag}",
+                          "-DRETRO_REVISION=${retroRevision}",
+
+                          // --- Game side ---
+                          "-DWITH_RSDK=ON",
+                          "-DGAME_STATIC=OFF",
+                          "-DGAME_NAME=Game",
+
+                          // --- Media codecs (music/video) ---
+                          // Keep ON for Ogg music & Theora videos
+                          "-DCOMPILE_OGG=ON",
+                          "-DCOMPILE_THEORA=ON"
             }
         }
+
+        // Build for arm64; add others if desired
         ndk {
-            abiFilters = []
-            abiFilters.addAll(ABIFILTERS.split(';').collect{it as String})
+            abiFilters "arm64-v8a"
         }
     }
+
     signingConfigs {
         release {
             storeFile file("../release-key.jks")
@@ -45,20 +67,33 @@ android {
             signingConfig signingConfigs.release
         }
     }
+
+    // Ensure Gradle uses the JNI CMake forwarder and a known CMake version
+    externalNativeBuild {
+        cmake {
+            path "jni/CMakeLists.txt"
+            version "3.22.1"
+        }
+    }
+
+    // If any dependency also bundles libc++_shared, avoid duplicate packaging errors
+    packagingOptions {
+        pickFirsts += ["**/libc++_shared.so"]
+    }
+
     namespace 'org.rems.rsdkv5'
+
     lint {
         abortOnError false
     }
+
+    // Optional: include prebuilt .so files from libs/ if you're not excluding them
     if (!project.hasProperty('EXCLUDE_NATIVE_LIBS')) {
-        sourceSets.main {
-            jniLibs.srcDir 'libs'
-        }
-        externalNativeBuild {
-            cmake {
-                path 'jni/CMakeLists.txt'
+        sourceSets {
+            main {
+                jniLibs.srcDir 'libs'
             }
         }
-       
     }
 }
 
