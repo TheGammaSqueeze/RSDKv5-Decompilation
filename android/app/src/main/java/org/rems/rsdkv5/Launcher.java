@@ -10,6 +10,7 @@ import android.os.Bundle;
 import android.os.CountDownTimer;
 import android.provider.DocumentsContract;
 import android.util.Log;
+import android.net.Uri;
 
 import androidx.activity.result.ActivityResultLauncher;
 import androidx.activity.result.contract.ActivityResultContracts;
@@ -141,7 +142,17 @@ public class Launcher extends AppCompatActivity {
                 e.printStackTrace();
             }
         }
-        return basePath;
+        // Default to /tree/primary:RSDK/V5 if nothing stored yet
+        if (basePath == null) {
+            try {
+                basePath = DocumentsContract.buildTreeDocumentUri(
+                        "com.android.externalstorage.documents",
+                        "primary:RSDK/V5");
+            } catch (Exception e) {
+                e.printStackTrace();
+            }
+        }
+return basePath;
     }
 
     private void startGame(boolean fromPicker) {
@@ -151,7 +162,7 @@ public class Launcher extends AppCompatActivity {
         boolean found = false;
         if (basePath != null) {
             for (UriPermission uriPermission : getContentResolver().getPersistedUriPermissions()) {
-                if (uriPermission.getUri().toString().matches(basePath.toString())) {
+                if (uriPermission.getUri().toString().equals(basePath.toString())) {
                     found = true;
                     break;
                 }
@@ -159,64 +170,68 @@ public class Launcher extends AppCompatActivity {
         }
 
         if (!found && !fromPicker) {
+            String shownPath;
+            if (basePath != null) {
+                String raw = basePath.toString();
+                int idx = raw.indexOf("/tree/");
+                if (idx != -1) {
+                    raw = raw.substring(idx); // strip leading content://
+                }
+                shownPath = Uri.decode(raw); // decode %3A -> ":" etc.
+            } else {
+                shownPath = "/tree/primary:RSDK/V5";
+            }
+
             new AlertDialog.Builder(this)
                     .setTitle("Path confirmation")
-                    .setMessage(basePath != null ? "Please reconfirm the path the game should run in."
-                            : "Please set the path the game should run in.")
-                    .setPositiveButton("OK", (dialog, i) -> {
+                    .setMessage("Use the default folder?\n\n" + shownPath +
+                            "\n\nor choose a different one?")
+                    .setPositiveButton("Use this", (dialog, i) -> {
+                        // keep default basePath and proceed (via picker to grant access)
                         folderPicker();
                     })
-                    .setNegativeButton("Cancel", (dialog, i) -> {
+                    .setNeutralButton("Change", (dialog, i) -> {
+                        folderPicker();
+                    })
+                    .setNegativeButton("Exit", (dialog, i) -> {
                         dialog.cancel();
                         quit(3);
                     })
                     .setCancelable(false)
                     .show();
         } else {
-            AlertDialog baseAlert = null;
+            // Permission already persisted for basePath; start immediately (no timer/dialog)
+            try {
+                if (DocumentFile.fromTreeUri(this, basePath).findFile(".nomedia") == null)
+                    createFile(".nomedia");
+            } catch (Exception e) {
+            }
 
-            DialogTimer timer = new DialogTimer(5000, 100);
+            Intent intent = new Intent(this, RSDK.class);
+            intent.setData(basePath);
+            intent.setFlags(Intent.FLAG_GRANT_WRITE_URI_PERMISSION |
+                    Intent.FLAG_GRANT_READ_URI_PERMISSION |
+                    Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION);
+            grantUriPermission(getApplicationContext().getPackageName() + ".RSDK", basePath,
+                    Intent.FLAG_GRANT_WRITE_URI_PERMISSION |
+                            Intent.FLAG_GRANT_READ_URI_PERMISSION |
+                            Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION);
 
-            baseAlert = new AlertDialog.Builder(this)
-                    .setTitle("Game starting")
-                    .setMessage("Game will start in...")
-                    .setPositiveButton("Start", (dialog, i) -> {
-                        timer.cancel();
-                        // String p = Environment.getExternalStorageDirectory().getAbsolutePath() + "/"
-                        // + basePath;
-                        try {
-                            if (DocumentFile.fromTreeUri(this, basePath).findFile(".nomedia") == null)
-                                createFile(".nomedia");
-                        } catch (Exception e) {
-                        }
+            getContentResolver().takePersistableUriPermission(basePath, takeFlags);
 
-                        Intent intent = new Intent(this, RSDK.class);
-                        intent.setData(basePath);
-                        intent.setFlags(Intent.FLAG_GRANT_WRITE_URI_PERMISSION |
-                                Intent.FLAG_GRANT_READ_URI_PERMISSION |
-                                Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION);
-                        grantUriPermission(getApplicationContext().getPackageName() + ".RSDK", basePath,
-                                Intent.FLAG_GRANT_WRITE_URI_PERMISSION |
-                                        Intent.FLAG_GRANT_READ_URI_PERMISSION |
-                                        Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION);
+            instance = this;
 
-                        getContentResolver().takePersistableUriPermission(basePath, takeFlags);
-
-                        instance = this;
-
-                        gameLauncher.launch(intent);
-                    })
-                    .setNeutralButton("Change Path", (dialog, i) -> {
-                        timer.cancel();
-                        getContentResolver().releasePersistableUriPermission(basePath, takeFlags);
-                        folderPicker();
-                    })
-                    .create();
-
-            timer.alert = baseAlert;
-            baseAlert.setOnShowListener(dialog -> timer.start());
-
-            baseAlert.show();
+            // Only warn if we truly don't see Data/ or Data.rsdk (case-insensitive) at the root.
+            if (!hasGameDataAtRoot()) {
+                new AlertDialog.Builder(this)
+                        .setTitle("Missing game data")
+                        .setMessage("Place the game data into the selected folder then press OK to proceed.")
+                        .setPositiveButton("OK", (dialog, i) -> launchGame())
+                        .setCancelable(true)
+                        .show();
+            } else {
+                launchGame();
+            }
         }
     }
 
@@ -228,6 +243,32 @@ public class Launcher extends AppCompatActivity {
                         .addFlags(Intent.FLAG_GRANT_WRITE_URI_PERMISSION |
                                 Intent.FLAG_GRANT_READ_URI_PERMISSION |
                                 Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION));
+    }
+
+    // Returns true if the selected root contains either a "Data" directory (any case)
+    // or a "Data.rsdk" file (any case). This avoids false "missing data" dialogs.
+    private boolean hasGameDataAtRoot() {
+        try {
+            DocumentFile root = DocumentFile.fromTreeUri(this, basePath);
+            if (root == null) return false;
+            DocumentFile[] kids = root.listFiles();
+            boolean hasDataDir = false;
+            boolean hasDataRsdk = false;
+            for (DocumentFile f : kids) {
+                final String name = f.getName();
+                if (name == null) continue;
+                if (name.equalsIgnoreCase("Data") && f.isDirectory()) {
+                    hasDataDir = true;
+                } else if (name.equalsIgnoreCase("Data.rsdk") && f.isFile()) {
+                    hasDataRsdk = true;
+                }
+                if (hasDataDir || hasDataRsdk) return true;
+            }
+            return false;
+        } catch (Throwable t) {
+            // If SAF throws for any reason, don't block launch – let the engine handle it.
+            return true;
+        }
     }
 
     public Uri createFile(String filename) throws FileNotFoundException {
@@ -252,4 +293,14 @@ public class Launcher extends AppCompatActivity {
             return find.getUri();
     }
 
+    // Launch RSDK activity with the currently selected basePath.
+    // We use the already-registered ActivityResultLauncher so quit() runs on return.
+    private void launchGame() {
+        Intent intent = new Intent(this, RSDK.class);
+        intent.setData(basePath);
+        intent.addFlags(Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+                | Intent.FLAG_GRANT_READ_URI_PERMISSION
+                | Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION);
+        gameLauncher.launch(intent);
+    }
 }
