@@ -2,6 +2,8 @@
 #include <main.hpp>
 #include <pthread.h>
 #include <sched.h>
+// NEW: Oboe backend lifecycle hooks
+#include <RSDK/Audio/Oboe/OboeAudioDevice.hpp>
 
 bool32 launched = false;
 // Make sure you assign this to the engine's main loop thread when you create it.
@@ -304,6 +306,41 @@ static inline void enterForeground()
 void AndroidCommandCallback(android_app *app, int32 cmd)
 {
     PrintLog(PRINT_NORMAL, "COMMAND %d %d", cmd, app->window ? 1 : 0);
+
+    // NEW: Inform the Oboe audio backend about lifecycle, in parallel with existing handling.
+    switch (cmd) {
+        case APP_CMD_PAUSE:
+        case APP_CMD_STOP:
+            RSDK::AudioDevice::NotifyAppBackground();
+            break;
+
+        case APP_CMD_TERM_WINDOW:
+            RSDK::AudioDevice::NotifyWindowAvailable(false);
+            RSDK::AudioDevice::NotifyAppBackground();
+            break;
+
+        case APP_CMD_INIT_WINDOW:
+            RSDK::AudioDevice::NotifyWindowAvailable(true);
+            break;
+
+        case APP_CMD_RESUME:
+        case APP_CMD_START:
+            RSDK::AudioDevice::NotifyAppForeground();
+            break;
+
+        case APP_CMD_GAINED_FOCUS:
+            RSDK::AudioDevice::NotifyFocusChanged(true);
+            break;
+
+        case APP_CMD_LOST_FOCUS:
+            RSDK::AudioDevice::NotifyFocusChanged(false);
+            break;
+
+        default:
+            break;
+    }
+
+    // Existing engine/platform handling (unchanged)
     switch (cmd) {
         // Window/surface lifecycle: safe place to (re)bind window & GL; keep here only.
         case APP_CMD_INIT_WINDOW:
