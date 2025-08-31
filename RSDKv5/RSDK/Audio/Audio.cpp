@@ -1,4 +1,5 @@
 #include "RSDK/Core/RetroEngine.hpp"
+#include <mutex>
 
 using namespace RSDK;
 
@@ -27,6 +28,9 @@ int32 streamLoopPoint  = 0;
 #define LINEAR_INTERPOLATION_LOOKUP_LENGTH  (TO_FIXED(1) / LINEAR_INTERPOLATION_LOOKUP_DIVISOR)
 
 float linearInterpolationLookup[LINEAR_INTERPOLATION_LOOKUP_LENGTH];
+
+// Serialize stream loads so only one worker touches the storage/vorbis state at a time.
+static std::mutex gStreamLoadLock;
 
 #if RETRO_AUDIODEVICE_XAUDIO
 #include "XAudio/XAudioDevice.cpp"
@@ -211,6 +215,10 @@ void RSDK::UpdateStreamBuffer(ChannelInfo *channel)
 
 void RSDK::LoadStream(ChannelInfo *channel)
 {
+#if 1
+    std::lock_guard<std::mutex> lk(gStreamLoadLock);
+#endif
+    
     if (channel->state != CHANNEL_LOADING_STREAM)
         return;
 

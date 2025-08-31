@@ -21,6 +21,28 @@ char RSDK::currentSceneID[0x10];
 
 SceneInfo RSDK::sceneInfo;
 
+// --- Helper: stop stream channels before we touch storage/defrag during reloads ---
+static void StopStreamingChannels()
+{
+    for (int32 c = 0; c < CHANNEL_COUNT; ++c) {
+        if (channels[c].state == CHANNEL_STREAM || channels[c].state == CHANNEL_LOADING_STREAM) {
+            channels[c].state   = CHANNEL_IDLE;
+            channels[c].soundID = -1;
+        }
+    }
+}
+
+// --- Helper: stop SFX playback without unloading SFX assets ---
+static void StopSfxChannels()
+{
+    for (int32 c = 0; c < CHANNEL_COUNT; ++c) {
+        if (channels[c].state == CHANNEL_SFX || channels[c].state == (CHANNEL_SFX | CHANNEL_PAUSED)) {
+            channels[c].state   = CHANNEL_IDLE;
+            channels[c].soundID = -1;
+        }
+    }
+}
+
 void RSDK::LoadSceneFolder()
 {
 #if RETRO_PLATFORM == RETRO_ANDROID
@@ -66,6 +88,9 @@ void RSDK::LoadSceneFolder()
 #if RETRO_REV02
     if (strcmp(currentSceneFolder, sceneInfo.listData[sceneInfo.listPos].folder) == 0 && !forceHardReset) {
         // Reload
+        // Ensure audio stop before defrag to avoid races with async stream worker
+        StopStreamingChannels();
+        StopSfxChannels(); // don't unload SFX on fast reload
         DefragmentAndGarbageCollectStorage(DATASET_STG);
         sceneInfo.filter = sceneInfo.listData[sceneInfo.listPos].filter;
         PrintLog(PRINT_NORMAL, "Reloading Scene \"%s - %s\" with filter %d", list->name, sceneInfo.listData[sceneInfo.listPos].name,
@@ -91,6 +116,8 @@ void RSDK::LoadSceneFolder()
 #if !RETRO_REV02
     if (strcmp(currentSceneFolder, sceneInfo.listData[sceneInfo.listPos].folder) == 0) {
         // Reload
+        StopStreamingChannels();
+        StopSfxChannels(); // don't unload SFX on fast reload
         DefragmentAndGarbageCollectStorage(DATASET_STG);
         PrintLog(PRINT_NORMAL, "Reloading Scene \"%s - %s\"", list->name, sceneInfo.listData[sceneInfo.listPos].name);
 
@@ -132,6 +159,7 @@ void RSDK::LoadSceneFolder()
     }
 
     // Clear stage storage
+    StopStreamingChannels();
     DefragmentAndGarbageCollectStorage(DATASET_STG);
     DefragmentAndGarbageCollectStorage(DATASET_SFX);
 

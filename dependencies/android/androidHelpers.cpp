@@ -1,9 +1,12 @@
 #include <RSDK/Core/RetroEngine.hpp>
 #include <main.hpp>
 #include <pthread.h>
+#include <sched.h>
 
 bool32 launched = false;
-pthread_t mainthread;
+// Make sure you assign this to the engine's main loop thread when you create it.
+// If you never set it, the priority helpers will no-op rather than touch random threads.
+pthread_t mainthread = 0;
 
 using namespace RSDK;
 
@@ -30,6 +33,34 @@ jmethodID fsRecurseIter = { 0 };
 #include <game-text-input/gametextinput.cpp>
 extern "C" {
 #include <game-activity/native_app_glue/android_native_app_glue.c>
+}
+
+// ---------- Priority helpers (thread-scoped, conservative) ----------
+static inline void setThreadBgIfKnown()
+{
+    if (!mainthread)
+        return; // avoid touching the wrong thread
+
+    struct sched_param sp {};
+    sp.sched_priority = 0;
+#ifdef SCHED_IDLE
+    if (pthread_setschedparam(mainthread, SCHED_IDLE, &sp) != 0) {
+        // fallback to default timesharing (no priority boost)
+        pthread_setschedparam(mainthread, SCHED_OTHER, &sp);
+    }
+#else
+    pthread_setschedparam(mainthread, SCHED_OTHER, &sp);
+#endif
+}
+
+static inline void setThreadFgIfKnown()
+{
+    if (!mainthread)
+        return;
+
+    struct sched_param sp {};
+    sp.sched_priority = 0;
+    pthread_setschedparam(mainthread, SCHED_OTHER, &sp);
 }
 
 struct JNISetup *GetJNISetup()
@@ -244,56 +275,81 @@ void SetLoadingIcon() {
     jni->env->CallVoidMethod(jni->thiz, setLoading, waitSpinner);
 }
 
+// ---------- Foreground/background state (no render deinit here) ----------
+static inline void enterBackground()
+{
+#if RETRO_REV02
+    if (SKU::userCore) SKU::userCore->focusState = 1;
+#else
+    engine.focusState &= (~1);
+#endif
+    videoSettings.windowState = WINDOWSTATE_INACTIVE;
+
+    // Only lower priority for the main engine thread if known.
+    setThreadBgIfKnown();
+}
+
+static inline void enterForeground()
+{
+#if RETRO_REV02
+    if (SKU::userCore) SKU::userCore->focusState = 0;
+#else
+    engine.focusState |= 1;
+#endif
+    videoSettings.windowState = WINDOWSTATE_ACTIVE;
+
+    setThreadFgIfKnown();
+}
 
 void AndroidCommandCallback(android_app *app, int32 cmd)
 {
     PrintLog(PRINT_NORMAL, "COMMAND %d %d", cmd, app->window ? 1 : 0);
     switch (cmd) {
+        // Window/surface lifecycle: safe place to (re)bind window & GL; keep here only.
         case APP_CMD_INIT_WINDOW:
         case APP_CMD_WINDOW_RESIZED:
         case APP_CMD_CONFIG_CHANGED:
         case APP_CMD_TERM_WINDOW:
-            videoSettings.windowState   = WINDOWSTATE_INACTIVE;
-            RenderDevice::isInitialized = false;
+            RenderDevice::isInitialized = false; // (re)create as needed by engine on next frame
             RenderDevice::window        = app->window;
-#if RETRO_REV02
-            if (SKU::userCore)
-                SKU::userCore->focusState = 1;
-#else
-            engine.focusState &= (~1);
-#endif
             if (app->window != NULL && cmd != APP_CMD_TERM_WINDOW) {
 #if RETRO_REV02
-                if (SKU::userCore)
-                    SKU::userCore->focusState = 0;
+                if (SKU::userCore) SKU::userCore->focusState = 0;
 #else
                 engine.focusState |= 1;
 #endif
                 videoSettings.windowState = WINDOWSTATE_ACTIVE;
                 SwappyGL_setWindow(app->window);
+            } else {
+#if RETRO_REV02
+                if (SKU::userCore) SKU::userCore->focusState = 1;
+#else
+                engine.focusState &= (~1);
+#endif
+                videoSettings.windowState = WINDOWSTATE_INACTIVE;
             }
             break;
-        case APP_CMD_STOP: Paddleboat_onStop(GetJNISetup()->env); break;
-        case APP_CMD_START: Paddleboat_onStart(GetJNISetup()->env); break;
-        case APP_CMD_GAINED_FOCUS: /*
-#if RETRO_REV02
-            if (SKU::userCore)
-                SKU::userCore->focusState = 0;
-#else
-            engine.focusState |= 1;
-#endif
-            videoSettings.windowState = WINDOWSTATE_ACTIVE;//*/
+
+        // App lifecycle (don’t twiddle render init flags here)
+        case APP_CMD_START:
+            Paddleboat_onStart(GetJNISetup()->env);
             break;
-        case APP_CMD_LOST_FOCUS: /*
-#if RETRO_REV02
-            if (SKU::userCore)
-                SKU::userCore->focusState = 1;
-#else
-            engine.focusState &= (~1);
-#endif
-            videoSettings.windowState = WINDOWSTATE_INACTIVE; //*/
+        case APP_CMD_STOP:
+            Paddleboat_onStop(GetJNISetup()->env);
             break;
-        default: break;
+
+        case APP_CMD_PAUSE:
+        case APP_CMD_LOST_FOCUS:
+            enterBackground();
+            break;
+
+        case APP_CMD_RESUME:
+        case APP_CMD_GAINED_FOCUS:
+            enterForeground();
+            break;
+
+        default:
+            break;
     }
 }
 

@@ -1,6 +1,12 @@
 #include "RSDK/Core/RetroEngine.hpp"
+#include <mutex>
 
 using namespace RSDK;
+
+#if 1
+// Global storage arena lock — protects both allocation and defrag/GC from racing
+static std::recursive_mutex gStorageLock;
+#endif
 
 #if RETRO_REV0U
 #include "Legacy/UserStorageLegacy.cpp"
@@ -74,6 +80,10 @@ void RSDK::ReleaseStorage()
 
 void RSDK::AllocateStorage(void **dataPtr, uint32 size, StorageDataSets dataSet, bool32 clear)
 {
+#if 1
+    std::lock_guard<std::recursive_mutex> lk(gStorageLock);
+#endif
+
     uint32 **data = (uint32 **)dataPtr;
     *data         = NULL;
 
@@ -222,6 +232,10 @@ void RSDK::RemoveStorageEntry(void **dataPtr)
 // This defragments the storage, leaving all empty space at the end.
 void RSDK::DefragmentAndGarbageCollectStorage(StorageDataSets set)
 {
+#if 1
+    std::lock_guard<std::recursive_mutex> lk(gStorageLock);
+#endif
+    
     uint32 processedStorage = 0;
     uint32 unusedStorage    = 0;
 
