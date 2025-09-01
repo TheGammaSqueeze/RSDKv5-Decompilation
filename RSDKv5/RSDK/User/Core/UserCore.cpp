@@ -35,6 +35,11 @@ namespace SKU
 
 using namespace RSDK;
 
+#if RETRO_PLATFORM == RETRO_ANDROID
+// Declare the fence at file scope to avoid "expected unqualified-id" errors.
+extern "C" void RSDK_PlatformBackgroundFenceTick();
+#endif
+
 #if RETRO_REV02
 SKU::UserCore *RSDK::SKU::userCore = NULL;
 #endif
@@ -209,6 +214,11 @@ void RSDK::SKU::UserCore::FrameInit()
     richPresence->FrameInit();
     stats->FrameInit();
     userStorage->FrameInit();
+    
+    // Park the game loop when backgrounded/unfocused (Android TV safe).
+#if RETRO_PLATFORM == RETRO_ANDROID
+    RSDK_PlatformBackgroundFenceTick();
+#endif
 }
 void RSDK::SKU::UserCore::OnUnknownEvent()
 {

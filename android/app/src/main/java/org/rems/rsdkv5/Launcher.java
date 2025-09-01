@@ -6,6 +6,9 @@ import android.content.Context;
 import android.content.Intent;
 import android.content.UriPermission;
 import android.net.Uri;
+import android.content.BroadcastReceiver;
+import android.content.IntentFilter;
+import android.os.PowerManager;
 import android.os.Bundle;
 import android.os.CountDownTimer;
 import android.provider.DocumentsContract;
@@ -29,6 +32,11 @@ import java.util.concurrent.TimeUnit;
 
 public class Launcher extends AppCompatActivity {
 
+    // Lifecycle hooks to native so the engine can park/unpark cleanly.
+    private static native void nativeSetBackgrounded(boolean bg);
+    private static native void nativeSetHasFocus(boolean hasFocus);
+    private static native void nativeOnTrimMemory();
+
     private static final int RSDK_VER = 5;
     private static Uri basePath = null;
 
@@ -41,6 +49,22 @@ public class Launcher extends AppCompatActivity {
 
     private static int takeFlags = (Intent.FLAG_GRANT_WRITE_URI_PERMISSION |
             Intent.FLAG_GRANT_READ_URI_PERMISSION);
+
+    // Screen state receiver (Android TV: covers power key / HDMI-CEC standby)
+    private final BroadcastReceiver screenReceiver = new BroadcastReceiver() {
+        @Override public void onReceive(Context ctx, Intent i) {
+            final String a = i.getAction();
+            try {
+                if (Intent.ACTION_SCREEN_OFF.equals(a)) {
+                    nativeSetHasFocus(false);
+                    nativeSetBackgrounded(true);
+                } else if (Intent.ACTION_SCREEN_ON.equals(a) || Intent.ACTION_USER_PRESENT.equals(a)) {
+                    nativeSetBackgrounded(false);
+                    nativeSetHasFocus(true);
+                }
+            } catch (Throwable ignored) {}
+        }
+    };
 
     @Override
     protected void onCreate(@Nullable Bundle savedInstanceState) {
@@ -89,8 +113,67 @@ public class Launcher extends AppCompatActivity {
             }
         }
 
+        // Register screen on/off + user-present (runtime; no manifest needed)
+        IntentFilter f = new IntentFilter();
+        f.addAction(Intent.ACTION_SCREEN_OFF);
+        f.addAction(Intent.ACTION_SCREEN_ON);
+        f.addAction(Intent.ACTION_USER_PRESENT);
+        registerReceiver(screenReceiver, f);
+
         if (canRun)
             startGame(false);
+    }
+
+    @Override
+    protected void onResume() {
+        super.onResume();
+        // Foreground → unpark
+        try {
+            nativeSetBackgrounded(false);
+            nativeSetHasFocus(true);
+        } catch (Throwable ignored) {}
+    }
+
+    @Override
+    protected void onPause() {
+        // Losing foreground → park ASAP
+        try {
+            nativeSetHasFocus(false);
+            nativeSetBackgrounded(true);
+        } catch (Throwable ignored) {}
+        super.onPause();
+    }
+
+    @Override
+    protected void onStop() {
+        // Fully backgrounded
+        try {
+            nativeSetBackgrounded(true);
+        } catch (Throwable ignored) {}
+        super.onStop();
+    }
+
+    @Override
+    public void onWindowFocusChanged(boolean hasFocus) {
+        super.onWindowFocusChanged(hasFocus);
+        try {
+            nativeSetHasFocus(hasFocus);
+            if (!hasFocus) nativeSetBackgrounded(true);
+        } catch (Throwable ignored) {}
+    }
+
+    @Override
+    public void onTrimMemory(int level) {
+        super.onTrimMemory(level);
+        try {
+            nativeOnTrimMemory(); // optional cache purge on pressure
+        } catch (Throwable ignored) {}
+    }
+
+    @Override
+    protected void onDestroy() {
+        try { unregisterReceiver(screenReceiver); } catch (Throwable ignored) {}
+        super.onDestroy();
     }
 
     private void quit(int code) {

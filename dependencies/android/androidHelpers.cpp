@@ -9,6 +9,9 @@
 #include <cstring>
 #include <cstdlib>
 #include <unistd.h>
+#include <atomic>
+#include <mutex>
+#include <condition_variable>
 
 bool32 launched = false;
 // Make sure you assign this to the engine's main loop thread when you create it.
@@ -40,6 +43,127 @@ jmethodID fsRecurseIter = { 0 };
 #include <game-text-input/gametextinput.cpp>
 extern "C" {
 #include <game-activity/native_app_glue/android_native_app_glue.c>
+}
+
+// -------- Foreground/Background synchronization fence --------
+static std::atomic<bool> gBackgrounded{false};
+static std::atomic<bool> gHasFocus{true};
+static std::mutex gPauseMutex;
+static std::condition_variable gPauseCv;
+
+// Centralized place to pause/unpause the audio backend.
+static void SetAudioPaused(bool paused) {
+    // Oboe backend cooperates with these calls.
+    if (paused) {
+        RSDK::AudioDevice::NotifyAppBackground();
+    } else {
+        RSDK::AudioDevice::NotifyAppForeground();
+    }
+}
+
+// Called from Java (Launcher) or internally from APP_CMD handlers.
+extern "C" void rsdk_setBackgrounded(bool bg) {
+    bool was = gBackgrounded.exchange(bg, std::memory_order_relaxed);
+    if (bg) {
+        SetAudioPaused(true);
+    } else if (was && !bg) {
+        SetAudioPaused(false);
+        gPauseCv.notify_all();
+    }
+}
+
+extern "C" void rsdk_setHasFocus(bool has) {
+    gHasFocus.store(has, std::memory_order_relaxed);
+    if (has) {
+        gPauseCv.notify_all();
+    }
+}
+
+// Public fence you can call once per frame from the render/update pump if needed.
+extern "C" void RSDK_PlatformBackgroundFenceTick() {
+    // Sleep in short chunks until we're both not backgrounded and have focus.
+    if (gBackgrounded.load(std::memory_order_relaxed) || !gHasFocus.load(std::memory_order_relaxed)) {
+        std::unique_lock<std::mutex> lk(gPauseMutex);
+        gPauseCv.wait_for(lk, std::chrono::milliseconds(250), [] {
+            return !gBackgrounded.load(std::memory_order_relaxed) && gHasFocus.load(std::memory_order_relaxed);
+        });
+    }
+}
+
+// JNI shims for Launcher.java
+extern "C" JNIEXPORT void JNICALL
+Java_org_rems_rsdkv5_Launcher_nativeSetBackgrounded(JNIEnv*, jclass, jboolean bg) {
+    rsdk_setBackgrounded(bg);
+}
+extern "C" JNIEXPORT void JNICALL
+Java_org_rems_rsdkv5_Launcher_nativeSetHasFocus(JNIEnv*, jclass, jboolean has) {
+    rsdk_setHasFocus(has);
+}
+extern "C" JNIEXPORT void JNICALL
+Java_org_rems_rsdkv5_Launcher_nativeOnTrimMemory(JNIEnv*, jclass) {
+    // Optional: free rebuildable caches/textures here if you keep any globals.
+}
+
+// -------- Android TV watchdog: poll PowerManager.isInteractive() --------
+static std::atomic<bool> gWatchdogRunning{false};
+static pthread_t gWatchdogThread = 0;
+
+static void* WatchdogMain(void*) {
+    // Poll cheaply (~4 Hz); robust for TV/CEC where Activity callbacks are sparse.
+    while (gWatchdogRunning.load(std::memory_order_acquire)) {
+        JNIEnv* env = nullptr;
+        app->activity->vm->AttachCurrentThread(&env, nullptr);
+
+        // GameActivity acts as a Context; use it to get PowerManager
+        jobject ctx = app->activity->javaGameActivity;
+        bool interactive = true; // default optimistic
+        if (ctx && env) {
+            jclass ctxCls = env->GetObjectClass(ctx);
+            if (ctxCls) {
+                jmethodID getSS = env->GetMethodID(ctxCls, "getSystemService",
+                                                   "(Ljava/lang/String;)Ljava/lang/Object;");
+                if (getSS) {
+                    jstring pwr = env->NewStringUTF("power");
+                    jobject pm = env->CallObjectMethod(ctx, getSS, pwr);
+                    env->DeleteLocalRef(pwr);
+                    if (pm) {
+                        jclass pmCls = env->GetObjectClass(pm);
+                        if (pmCls) {
+                            jmethodID isInteractive = env->GetMethodID(pmCls, "isInteractive", "()Z");
+                            if (isInteractive) {
+                                interactive = env->CallBooleanMethod(pm, isInteractive);
+                            }
+                            env->DeleteLocalRef(pmCls);
+                        }
+                        env->DeleteLocalRef(pm);
+                    }
+                }
+                env->DeleteLocalRef(ctxCls);
+            }
+        }
+        if (!interactive) {
+            // Force background when screen is off / not interactive.
+            rsdk_setHasFocus(false);
+            rsdk_setBackgrounded(true);
+        }
+        usleep(250 * 1000); // 250 ms
+    }
+    return nullptr;
+}
+
+static void StartWatchdogIfNeeded() {
+    if (gWatchdogRunning.load(std::memory_order_acquire)) return;
+    gWatchdogRunning.store(true, std::memory_order_release);
+    pthread_create(&gWatchdogThread, nullptr, &WatchdogMain, nullptr);
+}
+
+static void StopWatchdog() {
+    if (gWatchdogRunning.exchange(false)) {
+        if (gWatchdogThread) {
+            pthread_join(gWatchdogThread, nullptr);
+            gWatchdogThread = 0;
+        }
+    }
 }
 
 // --- Persist/Resume support ----------------------------------------------
@@ -432,6 +556,7 @@ static inline void enterBackground()
 
     // Only lower priority for the main engine thread if known.
     setThreadBgIfKnown();
+    rsdk_setBackgrounded(true);
 }
 
 static inline void enterForeground()
@@ -444,6 +569,8 @@ static inline void enterForeground()
     videoSettings.windowState = WINDOWSTATE_ACTIVE;
 
     setThreadFgIfKnown();
+    rsdk_setBackgrounded(false);
+    rsdk_setHasFocus(true);
 }
 
 void AndroidCommandCallback(android_app *app, int32 cmd)
@@ -454,12 +581,12 @@ void AndroidCommandCallback(android_app *app, int32 cmd)
     switch (cmd) {
         case APP_CMD_PAUSE:
         case APP_CMD_STOP:
-            RSDK::AudioDevice::NotifyAppBackground();
+            rsdk_setBackgrounded(true);
             break;
 
         case APP_CMD_TERM_WINDOW:
             RSDK::AudioDevice::NotifyWindowAvailable(false);
-            RSDK::AudioDevice::NotifyAppBackground();
+            rsdk_setBackgrounded(true);
             break;
 
         case APP_CMD_INIT_WINDOW:
@@ -467,7 +594,8 @@ void AndroidCommandCallback(android_app *app, int32 cmd)
             break;
 
         case APP_CMD_RESUME:
-            RSDK::AudioDevice::NotifyAppForeground();
+            rsdk_setBackgrounded(false);
+            rsdk_setHasFocus(true);
             break;
 
         case APP_CMD_START:
@@ -475,15 +603,21 @@ void AndroidCommandCallback(android_app *app, int32 cmd)
             LoadPersistIfAny(app);
             // Begin retrying resume in the background (idempotent).
             StartResumePumpIfNeeded();
-            RSDK::AudioDevice::NotifyAppForeground();
+            rsdk_setBackgrounded(false);
+            rsdk_setHasFocus(true);
+            StartWatchdogIfNeeded();
             break;
 
         case APP_CMD_GAINED_FOCUS:
             RSDK::AudioDevice::NotifyFocusChanged(true);
+            rsdk_setHasFocus(true);
+            rsdk_setBackgrounded(false);
             break;
 
         case APP_CMD_LOST_FOCUS:
             RSDK::AudioDevice::NotifyFocusChanged(false);
+            rsdk_setHasFocus(false);
+            rsdk_setBackgrounded(true);
             break;
 
         case APP_CMD_SAVE_STATE: {
@@ -516,6 +650,7 @@ void AndroidCommandCallback(android_app *app, int32 cmd)
             if (_jni_setup.thiz) { env_destroy->DeleteGlobalRef(_jni_setup.thiz); _jni_setup.thiz = nullptr; }
             if (_jni_setup.clazz) { env_destroy->DeleteGlobalRef(_jni_setup.clazz); _jni_setup.clazz = nullptr; }
             StopResumePump();
+            StopWatchdog();
             break;
         }
 
@@ -544,6 +679,7 @@ void AndroidCommandCallback(android_app *app, int32 cmd)
                 // If we have a pending resume token, apply it now (and the pump will keep trying if too early).
                 TryApplyPendingResume();
                 StartResumePumpIfNeeded();
+                gPauseCv.notify_all();
             }
             break;
         }
@@ -554,6 +690,7 @@ void AndroidCommandCallback(android_app *app, int32 cmd)
             SwappyGL_setWindow(nullptr);
             RenderDevice::isInitialized = false;
             RenderDevice::window        = nullptr;
+            rsdk_setBackgrounded(true);
 #if RETRO_REV02
             if (SKU::userCore) SKU::userCore->focusState = 1;
 #else
@@ -601,6 +738,7 @@ void AndroidCommandCallback(android_app *app, int32 cmd)
             SwappyGL_setWindow(nullptr);
             RenderDevice::isInitialized = false;
             RenderDevice::window        = nullptr;
+            rsdk_setBackgrounded(true);
             break;
         }
 
