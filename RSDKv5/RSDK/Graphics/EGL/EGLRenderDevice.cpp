@@ -397,6 +397,8 @@ bool RenderDevice::InitGraphicsAPI()
     glActiveTexture(GL_TEXTURE0);
     glGenTextures(SCREEN_COUNT, screenTextures);
 
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+
     for (int32 i = 0; i < SCREEN_COUNT; ++i) {
         glBindTexture(GL_TEXTURE_2D, screenTextures[i]);
         glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, textureSize.x, textureSize.y, 0, GL_RGB, GL_UNSIGNED_SHORT_5_6_5, NULL);

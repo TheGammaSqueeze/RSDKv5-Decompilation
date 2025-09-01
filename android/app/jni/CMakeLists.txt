@@ -1,6 +1,12 @@
 cmake_minimum_required(VERSION 3.22)
 project(ManiaAndroid LANGUAGES C CXX)
 
+# Stronger release opts for AArch64 (safe for this codebase)
+set(CMAKE_C_FLAGS_RELEASE   "${CMAKE_C_FLAGS_RELEASE} -O3 -funroll-loops -fstrict-aliasing")
+set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -O3 -funroll-loops -fstrict-aliasing")
+
+# Keep Debug friendly; just make Release fast.
+
 # Make cross-dir target_link_libraries legal in modern CMake graphs
 if(POLICY CMP0079)
   cmake_policy(SET CMP0079 NEW)
