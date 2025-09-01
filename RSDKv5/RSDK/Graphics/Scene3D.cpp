@@ -14,7 +14,28 @@ ScanEdge RSDK::scanEdgeBuffer[SCREEN_YSIZE * 2];
 
 // When true we run a half-height raster pass (skip/duplicate scan edges).
 // We toggle this only inside the *_SCREEN cases below so normal 2D remains full-res.
-static bool s_halfRes3D = true;
+static bool s_halfRes3D = false;
+
+// Half-res is allowed only during actual gameplay (not menus, not pause).
+static inline bool isGameplayActive() {
+    // REGULAR or REGULAR|STEPOVER, but NOT PAUSED/DEVMENU/FROZEN/etc.
+    return (sceneInfo.state & ENGINESTATE_REGULAR) == ENGINESTATE_REGULAR;
+}
+
+// Only enable half-res on *UFO* stages, and only on heavy 3D passes.
+static inline bool isUFOCurrentStage() {
+    if (!sceneInfo.listData) return false;
+    const SceneListEntry *cur = &sceneInfo.listData[sceneInfo.listPos];
+    if (!cur || !cur->folder || !cur->folder[0]) return false;
+    const char a = cur->folder[0], b = cur->folder[1], c = cur->folder[2];
+    return ((a == 'U' || a == 'u') && (b == 'F' || b == 'f') && (c == 'O' || c == 'o')); // "UFO1", "UFO2", ...
+}
+
+static inline bool shouldHalfRes(const Scene3D *scn) {
+    // Gate to gameplay (not pause/menu), UFO scenes, and sufficiently complex scenes.
+    return isGameplayActive() && isUFOCurrentStage() && scn && scn->faceCount >= 96; // tune threshold if needed
+}
+
 static inline bool isBackface2D(const Vector2 *p) {
     // 16.16 fixed, but sign of cross product is what matters.
     long long x1 = (long long)p[1].x - p[0].x;
@@ -1082,7 +1103,7 @@ void RSDK::Draw3DScene(uint16 sceneID)
                 break;
 
             case S3D_WIREFRAME_SCREEN: {
-                const bool prevHalf = s_halfRes3D; s_halfRes3D = true;
+                const bool prevHalf = s_halfRes3D; s_halfRes3D = shouldHalfRes(scn);
                 for (int32 f = 0; f < scn->faceCount; ++f) {
                     Scene3DVertex *drawVert = &scn->vertices[scn->faceBuffer[f].index];
 
@@ -1114,7 +1135,7 @@ void RSDK::Draw3DScene(uint16 sceneID)
                 break; }
 
             case S3D_SOLIDCOLOR_SCREEN: {
-                const bool prevHalf = s_halfRes3D; s_halfRes3D = true;
+                const bool prevHalf = s_halfRes3D; s_halfRes3D = shouldHalfRes(scn);
                 for (int32 f = 0; f < scn->faceCount; ++f) {
                     Scene3DVertex *drawVert = &scn->vertices[scn->faceBuffer[f].index];
                     int32 vertCount         = *vertCnt;
@@ -1142,7 +1163,7 @@ void RSDK::Draw3DScene(uint16 sceneID)
                 break; }
 
             case S3D_WIREFRAME_SHADED_SCREEN: {
-                const bool prevHalf = s_halfRes3D; s_halfRes3D = true;
+                const bool prevHalf = s_halfRes3D; s_halfRes3D = shouldHalfRes(scn);
                 for (int32 f = 0; f < scn->faceCount; ++f) {
                     Scene3DVertex *drawVert = &scn->vertices[scn->faceBuffer[f].index];
                     int32 vertCount         = *vertCnt;
@@ -1198,7 +1219,7 @@ void RSDK::Draw3DScene(uint16 sceneID)
                 break; }
 
             case S3D_SOLIDCOLOR_SHADED_SCREEN: {
-                const bool prevHalf = s_halfRes3D; s_halfRes3D = true;
+                const bool prevHalf = s_halfRes3D; s_halfRes3D = shouldHalfRes(scn);
                 for (int32 f = 0; f < scn->faceCount; ++f) {
                     Scene3DVertex *drawVert = &scn->vertices[scn->faceBuffer[f].index];
                     int32 vertCount         = *vertCnt;
@@ -1250,7 +1271,7 @@ void RSDK::Draw3DScene(uint16 sceneID)
                 break; }
 
             case S3D_SOLIDCOLOR_SHADED_BLENDED_SCREEN: {
-                const bool prevHalf = s_halfRes3D; s_halfRes3D = true;
+                const bool prevHalf = s_halfRes3D; s_halfRes3D = shouldHalfRes(scn);
                 for (int32 f = 0; f < scn->faceCount; ++f) {
                     Scene3DVertex *drawVert = &scn->vertices[scn->faceBuffer[f].index];
                     int32 vertCount         = *vertCnt;

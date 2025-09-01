@@ -43,11 +43,12 @@ static void StopSfxChannels()
     }
 }
 
+// Preserve streaming BGM (e.g., GHZ2 music) across scene loads to match original game behavior.
+// Set to false if you want the previous decomp behavior.
+static bool s_preserveStreamDuringSceneLoad = true;
+
 void RSDK::LoadSceneFolder()
 {
-#if RETRO_PLATFORM == RETRO_ANDROID
-    ShowLoadingIcon();
-#endif
 
 #if RETRO_USE_MOD_LOADER
     // run this before the game actually unloads all the objects & scene assets
@@ -88,8 +89,12 @@ void RSDK::LoadSceneFolder()
 #if RETRO_REV02
     if (strcmp(currentSceneFolder, sceneInfo.listData[sceneInfo.listPos].folder) == 0 && !forceHardReset) {
         // Reload
-        // Ensure audio stop before defrag to avoid races with async stream worker
-        StopStreamingChannels();
+        // In original Mania, BGM continues playing through fades/cutscenes.
+        // Only stop streams if we explicitly choose not to preserve them.
+        if (!s_preserveStreamDuringSceneLoad) {
+            // Ensure audio stop before defrag to avoid races with async stream worker
+            StopStreamingChannels();
+        }
         StopSfxChannels(); // don't unload SFX on fast reload
         DefragmentAndGarbageCollectStorage(DATASET_STG);
         sceneInfo.filter = sceneInfo.listData[sceneInfo.listPos].filter;
@@ -116,7 +121,10 @@ void RSDK::LoadSceneFolder()
 #if !RETRO_REV02
     if (strcmp(currentSceneFolder, sceneInfo.listData[sceneInfo.listPos].folder) == 0) {
         // Reload
-        StopStreamingChannels();
+        // Preserve stream (BGM) across reload to avoid cutting music during transitions
+        if (!s_preserveStreamDuringSceneLoad) {
+            StopStreamingChannels();
+        }
         StopSfxChannels(); // don't unload SFX on fast reload
         DefragmentAndGarbageCollectStorage(DATASET_STG);
         PrintLog(PRINT_NORMAL, "Reloading Scene \"%s - %s\"", list->name, sceneInfo.listData[sceneInfo.listPos].name);
@@ -159,7 +167,14 @@ void RSDK::LoadSceneFolder()
     }
 
     // Clear stage storage
-    StopStreamingChannels();
+    // Original game continues BGM into the next scene’s fade.
+    // Avoid killing the stream here unless we explicitly opt out.
+    if (!s_preserveStreamDuringSceneLoad) {
+        StopStreamingChannels();
+    }
+    // We still defragment storage; on typical Mania assets this is safe while the music stream keeps running.
+    // If a specific platform shows issues, temporarily set s_preserveStreamDuringSceneLoad=false.
+
     DefragmentAndGarbageCollectStorage(DATASET_STG);
     DefragmentAndGarbageCollectStorage(DATASET_SFX);
 
@@ -310,9 +325,6 @@ void RSDK::LoadSceneFolder()
 }
 void RSDK::LoadSceneAssets()
 {
-#if RETRO_PLATFORM == RETRO_ANDROID
-    ShowLoadingIcon();
-#endif
 
     memset(objectEntityList, 0, ENTITY_COUNT * sizeof(EntityBase));
 
