@@ -5,6 +5,11 @@
 // NEW: Oboe backend lifecycle hooks
 #include <RSDK/Audio/Oboe/OboeAudioDevice.hpp>
 
+#include <atomic>
+#include <cstring>
+#include <cstdlib>
+#include <unistd.h>
+
 bool32 launched = false;
 // Make sure you assign this to the engine's main loop thread when you create it.
 // If you never set it, the priority helpers will no-op rather than touch random threads.
@@ -37,6 +42,113 @@ extern "C" {
 #include <game-activity/native_app_glue/android_native_app_glue.c>
 }
 
+// --- Persist/Resume support ----------------------------------------------
+struct PersistBlob {
+    uint32_t magic;      // 'RSDK'
+    uint16_t version;    // 1
+    uint16_t reserved;
+    int32_t  activeCategory;
+    int32_t  listPos;
+};
+static PersistBlob gResume{};
+static std::atomic<bool> gHasResume{false};
+static std::atomic<bool> gAppliedResume{false};
+
+// tiny pump that retries resume until the engine is ready
+static std::atomic<bool> gResumePumpRunning{false};
+static pthread_t gResumePumpThread = 0;
+
+static inline uint32_t fourcc(char a, char b, char c, char d)
+{
+    return ((uint32_t)a << 24) | ((uint32_t)b << 16) | ((uint32_t)c << 8) | ((uint32_t)d);
+}
+
+static void LoadPersistIfAny(android_app *a)
+{
+    if (a->savedState && a->savedStateSize == sizeof(PersistBlob)) {
+        memcpy(&gResume, a->savedState, sizeof(PersistBlob));
+        if (gResume.magic == fourcc('R', 'S', 'D', 'K') && gResume.version == 1) {
+            gHasResume.store(true, std::memory_order_release);
+            gAppliedResume.store(false, std::memory_order_release);
+        }
+    }
+}
+
+// Safe to call repeatedly; will no-op once applied.
+// Now waits for scene list to exist so we can override Logos reliably.
+static void TryApplyPendingResume()
+{
+    if (!gHasResume.load(std::memory_order_acquire) || gAppliedResume.load())
+        return;
+
+    // Need a window to bind GL; without it we're too early.
+    if (!RenderDevice::window)
+        return;
+
+    // Wait until the engine has enumerated scenes (after GameConfig load).
+    if (sceneInfo.categoryCount <= 0 || !sceneInfo.listCategory)
+        return;
+
+    int c = gResume.activeCategory;
+    if (c < 0 || c >= sceneInfo.categoryCount)
+        return;
+
+    // Clamp listPos to the saved category range (defensive).
+    int start = sceneInfo.listCategory[c].sceneOffsetStart;
+    int end   = sceneInfo.listCategory[c].sceneOffsetEnd;
+    if (start >= end) // empty category? wait and retry later
+        return;
+
+    int p = gResume.listPos;
+    if (p < start) p = start;
+    if (p >= end)  p = end - 1;
+
+    // Mirror the F1/F2 debug path: set target and load.
+    sceneInfo.activeCategory = c;
+    sceneInfo.listPos        = p;
+    LoadScene();
+
+    gAppliedResume.store(true, std::memory_order_release);
+    gHasResume.store(false, std::memory_order_release);
+}
+
+// Background pump thread that re-tries resume until it succeeds or is cancelled.
+static void* ResumePumpMain(void*)
+{
+    // Keep poking ~60 Hz for a short period; stop once applied or told to stop.
+    int ticks = 0;
+    while (gResumePumpRunning.load(std::memory_order_acquire) && !gAppliedResume.load()) {
+        TryApplyPendingResume();
+        usleep(16 * 1000); // ~16ms
+        if (++ticks > 1200 && !gAppliedResume.load()) { // ~20s hard cap, bail out
+            break;
+        }
+    }
+    gResumePumpRunning.store(false, std::memory_order_release);
+    return nullptr;
+}
+
+static void StartResumePumpIfNeeded()
+{
+    if (!gHasResume.load(std::memory_order_acquire) || gResumePumpRunning.load())
+        return;
+    gResumePumpRunning.store(true, std::memory_order_release);
+    if (pthread_create(&gResumePumpThread, nullptr, &ResumePumpMain, nullptr) != 0) {
+        gResumePumpRunning.store(false, std::memory_order_release);
+    }
+}
+
+static void StopResumePump()
+{
+    if (gResumePumpRunning.exchange(false)) {
+        // If the thread was running, let it exit and join it.
+        if (gResumePumpThread) {
+            pthread_join(gResumePumpThread, nullptr);
+            gResumePumpThread = 0;
+        }
+    }
+}
+
 // ---------- Priority helpers (thread-scoped, conservative) ----------
 static inline void setThreadBgIfKnown()
 {
@@ -65,12 +177,39 @@ static inline void setThreadFgIfKnown()
     pthread_setschedparam(mainthread, SCHED_OTHER, &sp);
 }
 
-struct JNISetup *GetJNISetup()
+JNISetup *GetJNISetup()
 {
+    // Ensure this thread has a JNIEnv*
     app->activity->vm->AttachCurrentThread(&_jni_setup.env, NULL);
-    if (!_jni_setup.thiz) {
-        _jni_setup.thiz  = app->activity->javaGameActivity;
-        _jni_setup.clazz = _jni_setup.env->GetObjectClass(_jni_setup.thiz);
+
+    JNIEnv *env = _jni_setup.env;
+    // Current GameActivity instance from GameActivity/native_app_glue (a global ref owned by the glue)
+    jobject currentActivity = app->activity->javaGameActivity;
+
+    // Track the last seen GameActivity handle from the glue so we only refresh when it actually changes.
+    static jobject s_lastGlueActivity = nullptr;
+
+    // Refresh cached references if they don't exist or if the activity instance changed.
+    if (_jni_setup.thiz == nullptr || s_lastGlueActivity != currentActivity) {
+        // Drop old globals if any (they become invalid after Activity destroy).
+        if (_jni_setup.thiz) {
+            env->DeleteGlobalRef(_jni_setup.thiz);
+            _jni_setup.thiz = nullptr;
+        }
+        if (_jni_setup.clazz) {
+            env->DeleteGlobalRef(_jni_setup.clazz);
+            _jni_setup.clazz = nullptr;
+        }
+
+        // Promote current activity and its class to globals so they remain valid across threads/calls.
+        _jni_setup.thiz = env->NewGlobalRef(currentActivity);
+
+        jclass localCls = env->GetObjectClass(currentActivity);
+        _jni_setup.clazz = (jclass)env->NewGlobalRef(localCls);
+        env->DeleteLocalRef(localCls);
+
+        // Remember which glue Activity we mirrored, so we can detect future changes without touching JNI.
+        s_lastGlueActivity = currentActivity;
     }
     return &_jni_setup;
 }
@@ -79,8 +218,8 @@ FileIO *fOpen(const char *path, const char *mode)
 {
     app->activity->vm->AttachCurrentThread(&_jni_setup.env, NULL);
     jbyteArray jpath = _jni_setup.env->NewByteArray(strlen(path));
-    _jni_setup.env->SetByteArrayRegion(jpath, 0, strlen(path), (jbyte*)path);
-    int fd        = _jni_setup.env->CallIntMethod(_jni_setup.thiz, getFD, jpath, mode[0]);
+    _jni_setup.env->SetByteArrayRegion(jpath, 0, strlen(path), (jbyte *)path);
+    int fd = _jni_setup.env->CallIntMethod(_jni_setup.thiz, getFD, jpath, mode[0]);
     if (!fd)
         return NULL;
     return fdopen(fd, mode);
@@ -238,13 +377,14 @@ JNIEXPORT void JNICALL jnifunc(nativeOnTouch, RSDK, jint finger, jint action, jf
     }
 }
 
-JNIEXPORT jbyteArray JNICALL jnifunc(nativeLoadFile, RSDK, jstring file) {
-    const char* path = env->GetStringUTFChars(file, NULL);
+JNIEXPORT jbyteArray JNICALL jnifunc(nativeLoadFile, RSDK, jstring file)
+{
+    const char *path = env->GetStringUTFChars(file, NULL);
     FileInfo info;
     InitFileInfo(&info);
     if (LoadFile(&info, path, FMODE_RB)) {
         jbyteArray ret = env->NewByteArray(info.fileSize);
-        jbyte* array = env->GetByteArrayElements(ret, NULL);
+        jbyte *array   = env->GetByteArrayElements(ret, NULL);
         ReadBytes(&info, array, info.fileSize);
         CloseFile(&info);
         env->ReleaseByteArrayElements(ret, array, 0);
@@ -255,23 +395,26 @@ JNIEXPORT jbyteArray JNICALL jnifunc(nativeLoadFile, RSDK, jstring file) {
     return NULL;
 }
 
-void ShowLoadingIcon() {
-    auto* jni = GetJNISetup();
+void ShowLoadingIcon()
+{
+    auto *jni = GetJNISetup();
     jni->env->CallVoidMethod(jni->thiz, showLoading);
 }
 
-void HideLoadingIcon() {
-    auto* jni = GetJNISetup();
+void HideLoadingIcon()
+{
+    auto *jni = GetJNISetup();
     jni->env->CallVoidMethod(jni->thiz, hideLoading);
 }
 
-void SetLoadingIcon() {
-    auto* jni = GetJNISetup();
+void SetLoadingIcon()
+{
+    auto *jni = GetJNISetup();
     // cheating time
-    jstring name = jni->env->NewStringUTF("Data/Sprites/Android/Loading.bin");
+    jstring name           = jni->env->NewStringUTF("Data/Sprites/Android/Loading.bin");
     jbyteArray waitSpinner = jniname(nativeLoadFile, RSDK)(jni->env, jni->clazz, name);
     if (!waitSpinner) {
-        name = jni->env->NewStringUTF("Data/Sprites/UI/WaitSpinner.bin");
+        name        = jni->env->NewStringUTF("Data/Sprites/UI/WaitSpinner.bin");
         waitSpinner = jniname(nativeLoadFile, RSDK)(jni->env, jni->clazz, name);
     }
     jni->env->CallVoidMethod(jni->thiz, setLoading, waitSpinner);
@@ -324,7 +467,14 @@ void AndroidCommandCallback(android_app *app, int32 cmd)
             break;
 
         case APP_CMD_RESUME:
+            RSDK::AudioDevice::NotifyAppForeground();
+            break;
+
         case APP_CMD_START:
+            // The glue has populated app->savedState (if any) by now.
+            LoadPersistIfAny(app);
+            // Begin retrying resume in the background (idempotent).
+            StartResumePumpIfNeeded();
             RSDK::AudioDevice::NotifyAppForeground();
             break;
 
@@ -336,36 +486,82 @@ void AndroidCommandCallback(android_app *app, int32 cmd)
             RSDK::AudioDevice::NotifyFocusChanged(false);
             break;
 
+        case APP_CMD_SAVE_STATE: {
+            // Snapshot just enough to get back to the same scene quickly.
+            PersistBlob blob{};
+            blob.magic          = fourcc('R', 'S', 'D', 'K');
+            blob.version        = 1;
+            blob.activeCategory = sceneInfo.activeCategory;
+            blob.listPos        = sceneInfo.listPos;
+
+            // Portable fallback (works with your glued-in native_app_glue.c)
+            if (app->savedState) {
+                free(app->savedState);
+                app->savedState = nullptr;
+                app->savedStateSize = 0;
+            }
+            app->savedState = malloc(sizeof(PersistBlob));
+            if (app->savedState) {
+                memcpy(app->savedState, &blob, sizeof(PersistBlob));
+                app->savedStateSize = sizeof(PersistBlob);
+            }
+            break;
+        }
+
+        case APP_CMD_DESTROY: {
+            // Activity is going away; drop any cached global refs so we don't
+            // hold invalid JNI references across re-creation.
+            JNIEnv *env_destroy = nullptr;
+            app->activity->vm->AttachCurrentThread(&env_destroy, nullptr);
+            if (_jni_setup.thiz) { env_destroy->DeleteGlobalRef(_jni_setup.thiz); _jni_setup.thiz = nullptr; }
+            if (_jni_setup.clazz) { env_destroy->DeleteGlobalRef(_jni_setup.clazz); _jni_setup.clazz = nullptr; }
+            StopResumePump();
+            break;
+        }
+
         default:
             break;
     }
 
     // Existing engine/platform handling (unchanged)
     switch (cmd) {
-        // Window/surface lifecycle: safe place to (re)bind window & GL; keep here only.
+        // ---- Window/surface lifecycle ----
         case APP_CMD_INIT_WINDOW:
         case APP_CMD_WINDOW_RESIZED:
-        case APP_CMD_CONFIG_CHANGED:
-        case APP_CMD_TERM_WINDOW:
-            RenderDevice::isInitialized = false; // (re)create as needed by engine on next frame
+        case APP_CMD_CONFIG_CHANGED: {
+            // Fresh/broadcasted window from glue. Safe to adopt & (re)bind.
+            RenderDevice::isInitialized = false;
             RenderDevice::window        = app->window;
-            if (app->window != NULL && cmd != APP_CMD_TERM_WINDOW) {
+            if (RenderDevice::window) {
 #if RETRO_REV02
                 if (SKU::userCore) SKU::userCore->focusState = 0;
 #else
                 engine.focusState |= 1;
 #endif
                 videoSettings.windowState = WINDOWSTATE_ACTIVE;
-                SwappyGL_setWindow(app->window);
-            } else {
-#if RETRO_REV02
-                if (SKU::userCore) SKU::userCore->focusState = 1;
-#else
-                engine.focusState &= (~1);
-#endif
-                videoSettings.windowState = WINDOWSTATE_INACTIVE;
+                SwappyGL_setWindow(RenderDevice::window);
+
+                // If we have a pending resume token, apply it now (and the pump will keep trying if too early).
+                TryApplyPendingResume();
+                StartResumePumpIfNeeded();
             }
             break;
+        }
+
+        case APP_CMD_TERM_WINDOW: {
+            // The glue is about to null out app->window; do NOT copy the stale pointer.
+            // Proactively detach everything from the window and mark inactive.
+            SwappyGL_setWindow(nullptr);
+            RenderDevice::isInitialized = false;
+            RenderDevice::window        = nullptr;
+#if RETRO_REV02
+            if (SKU::userCore) SKU::userCore->focusState = 1;
+#else
+            engine.focusState &= (~1);
+#endif
+            videoSettings.windowState = WINDOWSTATE_INACTIVE;
+            break;
+        }
 
         // App lifecycle (don’t twiddle render init flags here)
         case APP_CMD_START:
@@ -381,9 +577,32 @@ void AndroidCommandCallback(android_app *app, int32 cmd)
             break;
 
         case APP_CMD_RESUME:
+            enterForeground();
+            // Safety net: try again on resume
+            TryApplyPendingResume();
+            StartResumePumpIfNeeded();
+            break;
+
         case APP_CMD_GAINED_FOCUS:
             enterForeground();
+            // Another good moment to apply, post-init.
+            TryApplyPendingResume();
+            StartResumePumpIfNeeded();
             break;
+
+        case APP_CMD_WINDOW_REDRAW_NEEDED:
+            // Some devices deliver this just after GL init; it’s another good moment to apply.
+            TryApplyPendingResume();
+            StartResumePumpIfNeeded();
+            break;
+
+        case APP_CMD_DESTROY: {
+            // Also make sure no stale window survives a full activity destroy.
+            SwappyGL_setWindow(nullptr);
+            RenderDevice::isInitialized = false;
+            RenderDevice::window        = nullptr;
+            break;
+        }
 
         default:
             break;
@@ -558,4 +777,30 @@ bool AndroidKeyUpCallback(GameActivity *activity, const GameActivityKeyEvent *ev
         case AKEYCODE_DEL: engine.gameSpeed = 1; return true;
     }
     return false;
+}
+
+// -----------------------------------------------------------------------------
+// Android warm-resume bridge for the engine boot code.
+// The engine will call these BEFORE it selects the initial scene.
+// -----------------------------------------------------------------------------
+extern "C" bool AndroidHasResumeToken()
+{
+    // A token exists if Android saved state (scene ids) and we haven't applied it yet.
+    return gHasResume.load(std::memory_order_acquire) && !gAppliedResume.load();
+}
+
+extern "C" bool AndroidConsumeResumeToken(int* outCategory, int* outListPos)
+{
+    if (!outCategory || !outListPos)
+        return false;
+    if (!AndroidHasResumeToken())
+        return false;
+
+    // Hand the saved scene ids to the engine and mark them as consumed.
+    *outCategory = gResume.activeCategory;
+    *outListPos  = gResume.listPos;
+
+    gAppliedResume.store(true, std::memory_order_release);
+    gHasResume.store(false, std::memory_order_release);
+    return true;
 }

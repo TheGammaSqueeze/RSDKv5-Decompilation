@@ -15,6 +15,15 @@ Link::Handle gameLogicHandle = NULL;
 #include <unistd.h>
 #endif
 
+// --- Android warm-resume bridge (implemented in dependencies/android/androidHelpers.cpp) ---
+// Engine calls these to check/apply a saved scene BEFORE defaulting to the splash.
+extern "C" bool AndroidHasResumeToken();
+extern "C" bool AndroidConsumeResumeToken(int *outCategory, int *outListPos);
+#if RETRO_PLATFORM != RETRO_ANDROID
+static inline bool AndroidHasResumeToken() { return false; }
+static inline bool AndroidConsumeResumeToken(int *, int *) { return false; }
+#endif
+
 int32 *RSDK::globalVarsPtr = NULL;
 #if RETRO_REV0U
 void (*RSDK::globalVarsInitCB)(void *globals) = NULL;
@@ -1188,6 +1197,30 @@ void RSDK::LoadGameConfig()
 #if RETRO_REV0U
         if (globalVarsInitCB)
             globalVarsInitCB(globalVarsPtr);
+#endif
+
+#if RETRO_PLATFORM == RETRO_ANDROID
+        // -----------------------------------------------------------------
+        // ANDROID WARM-RESUME:
+        // If the OS destroyed our Activity and we have a saved scene from
+        // androidHelpers.cpp, remap the boot selection to that scene.
+        // Do this BEFORE defaulting to Presentation/Logos.
+        // -----------------------------------------------------------------
+        if (AndroidHasResumeToken()) {
+            int cat = 0, pos = 0;
+            if (AndroidConsumeResumeToken(&cat, &pos)) {
+                if (sceneInfo.listCategory && cat >= 0 && cat < sceneInfo.categoryCount) {
+                    const int start = sceneInfo.listCategory[cat].sceneOffsetStart;
+                    const int end   = sceneInfo.listCategory[cat].sceneOffsetEnd;
+                    if (end > start) {
+                        if (pos < start) pos = start;
+                        if (pos >= end)  pos = end - 1;
+                        sceneInfo.activeCategory = cat;
+                        startScene               = pos - start; // adjust relative index
+                    }
+                }
+            }
+        }
 #endif
 
         sceneInfo.listPos = sceneInfo.listCategory[sceneInfo.activeCategory].sceneOffsetStart + startScene;

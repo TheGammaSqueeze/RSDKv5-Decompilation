@@ -45,9 +45,12 @@
             android:exported="true" 
             android:icon="@mipmap/ic_launcher"
             android:alwaysRetainTaskState="true"
-            android:launchMode="singleInstance"
+            android:launchMode="singleTask"
+            android:resizeableActivity="false"
+            android:stopWithTask="false"
+            android:allowTaskReparenting="true"
             android:screenOrientation="sensorLandscape"
-            android:configChanges="orientation|keyboardHidden|screenSize"
+            android:configChanges="keyboard|keyboardHidden|navigation|orientation|screenLayout|screenSize|smallestScreenSize|uiMode|density"
 
             android:theme="@style/AppTheme">
 
