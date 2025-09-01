@@ -12,6 +12,18 @@ Scene3D RSDK::scene3DList[SCENE3D_COUNT];
 
 ScanEdge RSDK::scanEdgeBuffer[SCREEN_YSIZE * 2];
 
+// When true we run a half-height raster pass (skip/duplicate scan edges).
+// We toggle this only inside the *_SCREEN cases below so normal 2D remains full-res.
+static bool s_halfRes3D = true;
+static inline bool isBackface2D(const Vector2 *p) {
+    // 16.16 fixed, but sign of cross product is what matters.
+    long long x1 = (long long)p[1].x - p[0].x;
+    long long y1 = (long long)p[1].y - p[0].y;
+    long long x2 = (long long)p[2].x - p[0].x;
+    long long y2 = (long long)p[2].y - p[0].y;
+    return (x1 * y2 - y1 * x2) >= 0;
+}
+
 enum ModelFlags {
     MODEL_NOFLAGS     = 0,
     MODEL_USENORMALS  = 1 << 0,
@@ -48,14 +60,26 @@ void RSDK::ProcessScanEdge(int32 x1, int32 y1, int32 x2, int32 y2)
             }
 
             ScanEdge *edge = &scanEdgeBuffer[top];
-            for (int32 i = top; i < bottom; ++i) {
+            const int step = s_halfRes3D ? 2 : 1;
+            // Keep even/odd alignment stable
+            if (s_halfRes3D && (top & 1)) {
+                scanPos += delta;
+                ++top;
+                ++edge;
+            }
+            for (int32 i = top; i < bottom; i += step) {
                 int32 scanX = scanPos >> 16;
                 if (scanX < edge->start)
                     edge->start = scanX;
                 if (scanX > edge->end)
                     edge->end = scanX;
-                scanPos += delta;
-                ++edge;
+                if (step == 2 && (i + 1) < bottom) {
+                    // Duplicate edge to the skipped scanline to preserve visual continuity
+                    edge[1].start = edge[0].start;
+                    edge[1].end   = edge[0].end;
+                }
+                scanPos += delta * step;
+                edge += step;
             }
         }
     }
@@ -126,7 +150,16 @@ void RSDK::ProcessScanEdgeClr(uint32 c1, uint32 c2, int32 x1, int32 y1, int32 x2
             }
 
             ScanEdge *edge = &scanEdgeBuffer[top];
-            for (int32 i = top; i < bottom; ++i) {
+            const int step = s_halfRes3D ? 2 : 1;
+            if (s_halfRes3D && (top & 1)) {
+                scanX += deltaX;
+                scanR += deltaR;
+                scanG += deltaG;
+                scanB += deltaB;
+                ++top;
+                ++edge;
+            }
+            for (int32 i = top; i < bottom; i += step) {
                 if (FROM_FIXED(scanX) < edge->start) {
                     edge->start = FROM_FIXED(scanX);
 
@@ -143,13 +176,22 @@ void RSDK::ProcessScanEdgeClr(uint32 c1, uint32 c2, int32 x1, int32 y1, int32 x2
                     edge->endB = scanB;
                 }
 
-                scanX += deltaX;
+                if (step == 2 && (i + 1) < bottom) {
+                    edge[1].start  = edge[0].start;
+                    edge[1].end    = edge[0].end;
+                    edge[1].startR = edge[0].startR;
+                    edge[1].startG = edge[0].startG;
+                    edge[1].startB = edge[0].startB;
+                    edge[1].endR   = edge[0].endR;
+                    edge[1].endG   = edge[0].endG;
+                    edge[1].endB   = edge[0].endB;
+                }
 
-                scanR += deltaR;
-                scanG += deltaG;
-                scanB += deltaB;
-
-                ++edge;
+                scanX += deltaX * step;
+                scanR += deltaR * step;
+                scanG += deltaG * step;
+                scanB += deltaB * step;
+                edge += step;
             }
         }
     }
@@ -874,9 +916,8 @@ void RSDK::Draw3DScene(uint16 sceneID)
             ++faceVertCounts;
         }
 
-        // Sort faces by depth (descending). UFO scenes can push hundreds of faces
-        // so O(n log n) here is a large CPU win on low-power cores.
-        std::stable_sort(scn->faceBuffer, scn->faceBuffer + scn->faceCount,
+        // Sort faces by depth (descending). Introsort is typically fastest here.
+        std::sort(scn->faceBuffer, scn->faceBuffer + scn->faceCount,
                          [](const Scene3DFace &A, const Scene3DFace &B) {
                              return A.depth > B.depth;
                          });
@@ -1040,7 +1081,8 @@ void RSDK::Draw3DScene(uint16 sceneID)
                 }
                 break;
 
-            case S3D_WIREFRAME_SCREEN:
+            case S3D_WIREFRAME_SCREEN: {
+                const bool prevHalf = s_halfRes3D; s_halfRes3D = true;
                 for (int32 f = 0; f < scn->faceCount; ++f) {
                     Scene3DVertex *drawVert = &scn->vertices[scn->faceBuffer[f].index];
 
@@ -1057,6 +1099,7 @@ void RSDK::Draw3DScene(uint16 sceneID)
                     }
 
                     if (v < 0xFF) {
+                        if (*vertCnt >= 3 && isBackface2D(vertPos)) { vertCnt++; continue; }
                         for (int32 v = 0; v < *vertCnt - 1; ++v) {
                             DrawLine(vertPos[v + 0].x, vertPos[v + 0].y, vertPos[v + 1].x, vertPos[v + 1].y, drawVert[0].color, entity->alpha,
                                      entity->inkEffect, true);
@@ -1067,9 +1110,11 @@ void RSDK::Draw3DScene(uint16 sceneID)
 
                     vertCnt++;
                 }
-                break;
+                s_halfRes3D = prevHalf;
+                break; }
 
-            case S3D_SOLIDCOLOR_SCREEN:
+            case S3D_SOLIDCOLOR_SCREEN: {
+                const bool prevHalf = s_halfRes3D; s_halfRes3D = true;
                 for (int32 f = 0; f < scn->faceCount; ++f) {
                     Scene3DVertex *drawVert = &scn->vertices[scn->faceBuffer[f].index];
                     int32 vertCount         = *vertCnt;
@@ -1087,14 +1132,17 @@ void RSDK::Draw3DScene(uint16 sceneID)
                     }
 
                     if (v < 0xFF) {
+                        if (*vertCnt >= 3 && isBackface2D(vertPos)) { vertCnt++; continue; }
                         DrawFace(vertPos, *vertCnt, (drawVert[0].color >> 16) & 0xFF, (drawVert[0].color >> 8) & 0xFF,
                                  (drawVert[0].color >> 0) & 0xFF, entity->alpha, entity->inkEffect);
                     }
                     vertCnt++;
                 }
-                break;
+                s_halfRes3D = prevHalf;
+                break; }
 
-            case S3D_WIREFRAME_SHADED_SCREEN:
+            case S3D_WIREFRAME_SHADED_SCREEN: {
+                const bool prevHalf = s_halfRes3D; s_halfRes3D = true;
                 for (int32 f = 0; f < scn->faceCount; ++f) {
                     Scene3DVertex *drawVert = &scn->vertices[scn->faceBuffer[f].index];
                     int32 vertCount         = *vertCnt;
@@ -1114,6 +1162,7 @@ void RSDK::Draw3DScene(uint16 sceneID)
                     }
 
                     if (v < 0xFF) {
+                        if (*vertCnt >= 3 && isBackface2D(vertPos)) { vertCnt++; continue; }
                         int32 normal    = ny1 / vertCount;
                         int32 normalVal = (normal >> 2) * (abs(normal) >> 2);
 
@@ -1145,9 +1194,11 @@ void RSDK::Draw3DScene(uint16 sceneID)
 
                     vertCnt++;
                 }
-                break;
+                s_halfRes3D = prevHalf;
+                break; }
 
-            case S3D_SOLIDCOLOR_SHADED_SCREEN:
+            case S3D_SOLIDCOLOR_SHADED_SCREEN: {
+                const bool prevHalf = s_halfRes3D; s_halfRes3D = true;
                 for (int32 f = 0; f < scn->faceCount; ++f) {
                     Scene3DVertex *drawVert = &scn->vertices[scn->faceBuffer[f].index];
                     int32 vertCount         = *vertCnt;
@@ -1167,6 +1218,7 @@ void RSDK::Draw3DScene(uint16 sceneID)
                     }
 
                     if (v < 0xFF) {
+                        if (*vertCnt >= 3 && isBackface2D(vertPos)) { vertCnt++; continue; }
                         int32 normal    = ny / vertCount;
                         int32 normalVal = (normal >> 2) * (abs(normal) >> 2);
 
@@ -1194,9 +1246,11 @@ void RSDK::Draw3DScene(uint16 sceneID)
 
                     vertCnt++;
                 }
-                break;
+                s_halfRes3D = prevHalf;
+                break; }
 
-            case S3D_SOLIDCOLOR_SHADED_BLENDED_SCREEN:
+            case S3D_SOLIDCOLOR_SHADED_BLENDED_SCREEN: {
+                const bool prevHalf = s_halfRes3D; s_halfRes3D = true;
                 for (int32 f = 0; f < scn->faceCount; ++f) {
                     Scene3DVertex *drawVert = &scn->vertices[scn->faceBuffer[f].index];
                     int32 vertCount         = *vertCnt;
@@ -1238,13 +1292,15 @@ void RSDK::Draw3DScene(uint16 sceneID)
                     }
 
                     if (v < 0xFF) {
+                        if (*vertCnt >= 3 && isBackface2D(vertPos)) { vertCnt++; continue; }
                         drawVert = &scn->vertices[scn->faceBuffer[f].index];
                         DrawBlendedFace(vertPos, vertClrs, *vertCnt, entity->alpha, entity->inkEffect);
                     }
 
                     vertCnt++;
                 }
-                break;
+                s_halfRes3D = prevHalf;
+                break; }
         }
     }
 }

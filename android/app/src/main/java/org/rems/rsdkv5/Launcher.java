@@ -6,6 +6,7 @@ import android.content.Context;
 import android.content.Intent;
 import android.content.UriPermission;
 import android.net.Uri;
+import android.os.Process;
 import android.content.BroadcastReceiver;
 import android.content.IntentFilter;
 import android.os.PowerManager;
@@ -119,6 +120,9 @@ public class Launcher extends AppCompatActivity {
         f.addAction(Intent.ACTION_SCREEN_ON);
         f.addAction(Intent.ACTION_USER_PRESENT);
         registerReceiver(screenReceiver, f);
+
+        // Give the foreground thread display priority; reduces preemption/jank on low-power CPUs.
+        try { Process.setThreadPriority(Process.THREAD_PRIORITY_DISPLAY); } catch (Throwable ignored) {}
 
         if (canRun)
             startGame(false);

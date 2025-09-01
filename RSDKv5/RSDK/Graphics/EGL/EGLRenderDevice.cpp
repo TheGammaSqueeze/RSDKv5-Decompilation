@@ -80,7 +80,17 @@ ANativeWindow *RenderDevice::window;
 GLuint RenderDevice::VAO;
 GLuint RenderDevice::VBO;
 
+// Front buffer used for sampling this frame:
 GLuint RenderDevice::screenTextures[SCREEN_COUNT];
+// Back buffer we upload into this frame, then swap:
+static GLuint screenTexturesBack[SCREEN_COUNT];
+static inline void swapScreenTextureSets() {
+    for (int i = 0; i < SCREEN_COUNT; ++i) {
+        GLuint tmp              = RenderDevice::screenTextures[i];
+        RenderDevice::screenTextures[i] = screenTexturesBack[i];
+        screenTexturesBack[i]   = tmp;
+    }
+}
 GLuint RenderDevice::imageTexture;
 
 #if RETRO_PLATFORM == RETRO_ANDROID
@@ -396,13 +406,24 @@ bool RenderDevice::InitGraphicsAPI()
 
     glActiveTexture(GL_TEXTURE0);
     glGenTextures(SCREEN_COUNT, screenTextures);
+    glGenTextures(SCREEN_COUNT, screenTexturesBack);
 
     glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
 
     for (int32 i = 0; i < SCREEN_COUNT; ++i) {
+        // Front set (sampled this frame)
         glBindTexture(GL_TEXTURE_2D, screenTextures[i]);
         glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, textureSize.x, textureSize.y, 0, GL_RGB, GL_UNSIGNED_SHORT_5_6_5, NULL);
 
+
+        glTexParameterf(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glTexParameterf(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        glTexParameterf(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameterf(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        
+        // Back set (uploaded this frame)
+        glBindTexture(GL_TEXTURE_2D, screenTexturesBack[i]);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, textureSize.x, textureSize.y, 0, GL_RGB, GL_UNSIGNED_SHORT_5_6_5, NULL);
         glTexParameterf(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
         glTexParameterf(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
         glTexParameterf(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
@@ -620,7 +641,7 @@ void RenderDevice::CopyFrameBuffer()
         return;
 
     for (int32 s = 0; s < videoSettings.screenCount; ++s) {
-        glBindTexture(GL_TEXTURE_2D, screenTextures[s]);
+        glBindTexture(GL_TEXTURE_2D, screenTexturesBack[s]);
         glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, screens[s].pitch, SCREEN_YSIZE, GL_RGB, GL_UNSIGNED_SHORT_5_6_5, screens[s].frameBuffer);
     }
 }
@@ -759,12 +780,15 @@ void RenderDevice::FlipScreen()
         }
     }
 #endif
+    // After presenting, flip front/back so next frame samples what we just uploaded.
+    swapScreenTextureSets();
 }
 
 void RenderDevice::Release(bool32 isRefresh)
 {
     if (display != EGL_NO_DISPLAY) {
         glDeleteTextures(SCREEN_COUNT, screenTextures);
+        glDeleteTextures(SCREEN_COUNT, screenTexturesBack);
         glDeleteTextures(1, &imageTexture);
 
         if (videoBuffer)
@@ -1148,6 +1172,9 @@ void RenderDevice::SetLinear(bool32 linear)
         return;
     for (int32 i = 0; i < SCREEN_COUNT; ++i) {
         glBindTexture(GL_TEXTURE_2D, screenTextures[i]);
+        glTexParameterf(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, linear ? GL_LINEAR : GL_NEAREST);
+        glTexParameterf(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, linear ? GL_LINEAR : GL_NEAREST);
+        glBindTexture(GL_TEXTURE_2D, screenTexturesBack[i]);
         glTexParameterf(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, linear ? GL_LINEAR : GL_NEAREST);
         glTexParameterf(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, linear ? GL_LINEAR : GL_NEAREST);
     }

@@ -7,6 +7,15 @@ set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -O3 -funroll-loops -fstr
 
 # Keep Debug friendly; just make Release fast.
 
+# Thin-LTO if the NDK/Clang supports it
+include(CheckCXXCompilerFlag)
+check_cxx_compiler_flag("-flto=thin" HAS_THINLTO)
+if (HAS_THINLTO)
+  set(CMAKE_C_FLAGS_RELEASE                "${CMAKE_C_FLAGS_RELEASE} -flto=thin")
+  set(CMAKE_CXX_FLAGS_RELEASE              "${CMAKE_CXX_FLAGS_RELEASE} -flto=thin")
+  set(CMAKE_SHARED_LINKER_FLAGS_RELEASE    "${CMAKE_SHARED_LINKER_FLAGS_RELEASE} -flto=thin")
+endif()
+
 # Make cross-dir target_link_libraries legal in modern CMake graphs
 if(POLICY CMP0079)
   cmake_policy(SET CMP0079 NEW)
